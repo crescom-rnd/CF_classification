@@ -22,13 +22,17 @@ import timm
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DATA_CSV = "crop_summary_with_folds.csv"
-MODE = "STAGE1"  # or "STAGE2"
+# MODE = "STAGE1"  # or "STAGE2"
+MODE = "STAGE2"
 N_SPLITS = 5
 MODEL_NAME = "convnext_base.fb_in22k_ft_in1k_384"
+# MODEL_NAME = "convnext_base.fb_in22k_ft_in1k"
+# MODEL_NAME = "maxvit_base_tf_384.in21k_ft_in1k"
 IMG_SIZE = 384
-EPOCHS = 20
-BATCH_SIZE = 24
-SAVE_DIR = f"result_weights/patient_kfold/260227_{MODE}_{MODEL_NAME}"
+# IMG_SIZE = 256
+EPOCHS = 15
+BATCH_SIZE = 12
+SAVE_DIR = f"result_weights/P6_augmentation/{MODE}_{MODEL_NAME}"
 
 NUM_CLASSES = 3 if MODE == "STAGE1" else 2
 
@@ -134,6 +138,9 @@ def build_transforms(img_size: int):
         HistogramFlattening(),
         SquarePad(),
         transforms.Resize((img_size, img_size)),
+        # stage 2 추가
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.95, 1.05)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -178,13 +185,19 @@ def train_one_fold(fold, df_all):
     model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=NUM_CLASSES).to(DEVICE)
 
     if MODE == "STAGE1":
-        criterion = FocalLoss(alpha=5.0, gamma=2.0)
+        # criterion = FocalLoss(alpha=5.0, gamma=2.0)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     else:
         # STAGE2 2-class default
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.0)
+        criterion = FocalLoss(alpha=1.0, gamma=2.0)
+        # criterion = nn.CrossEntropyLoss(label_smoothing=0.0)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1, eta_min=1e-6)
+
+    # AMP 스케일러 추가
+    # scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     best_f1 = -1.0
     best_path = os.path.join(SAVE_DIR, f"best_model_fold_{fold}.pth")
@@ -198,10 +211,19 @@ def train_one_fold(fold, df_all):
         for x, y in tqdm(train_loader, desc=f"[Fold {fold}] Epoch {epoch+1}", leave=False):
             x, y = x.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
-            out = model(x)
-            loss = criterion(out, y)
-            loss.backward()
-            optimizer.step()
+
+            with torch.amp.autocast("cuda"):
+                out = model(x)
+                loss = criterion(out, y)
+
+            # out = model(x)
+            # loss = criterion(out, y)
+            # loss.backward()
+            # optimizer.step()
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += loss.item() * x.size(0)
             pred = out.argmax(1)
